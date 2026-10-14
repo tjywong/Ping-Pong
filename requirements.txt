@@ -1,0 +1,9 @@
+legoeducation==1.1.1            # Double Motor over Bluetooth (via lelib.py)
+# MediaPipe must stay on 0.10.21: 1.x crashes on Apple Silicon (DrishtiMetalHelper).
+mediapipe==0.10.21              # pose landmarker
+# OpenCV comes from mediapipe's own dependency, opencv-contrib-python, which
+# includes cv2.aruco for the AprilTags. Don't add opencv-python alongside it:
+# the two fight over the cv2 module, and 5.x needs numpy 2, which mediapipe can't use.
+opencv-contrib-python==4.11.0.86
+numpy<2
+paho-mqtt>=2.0                  # score publishing (via mqttlib.py)
