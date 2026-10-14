@@ -5,8 +5,9 @@ A virtual ball flies at you down an on-screen table. To return it, two things
 have to be true at the moment it arrives:
 
   - Pose (MediaPipe): your paddle hand is where the ball is on screen.
-  - IMU (the hub's gyroscope): you are actually swinging, not just holding
-    your hand in the right spot.
+  - IMU (the hub's gyroscope): you are actually swinging -- one stroke that
+    turns the paddle through a real angle while your arm moves -- not just
+    holding your hand in the right spot or shaking the hub.
 
 AprilTags (tag36h11) run the game from across the room, no keyboard needed:
 
@@ -24,7 +25,7 @@ ME193/Rogers/<name> as a floating point number, e.g. "12.0".
 
 Keys while the game window has focus:
     space   start (same as tag 0)        1-5   pick level (same as tags 1-5)
-    c       calibrate the swing threshold (swing hard for 2 s)
+    c       calibrate the swing (take 2-3 real swings in 3 s)
     h       switch paddle hand           r     reset the record
     q/ESC   quit
 """
@@ -36,6 +37,7 @@ import math
 import os
 import random
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -73,7 +75,8 @@ TAG_DETECT_WIDTH = 1280     # only downscale frames wider than this (1080p is to
 HIT_RADIUS = 0.09           # paddle reach (blade + ball), as a fraction of frame width
 EARLY_S = 0.25              # a hit may land this long before the ball arrives...
 LATE_S = 0.15               # ...or this long after
-SWING_WINDOW_S = 0.25       # the swing must peak within this long of contact
+SWING_WINDOW_S = 0.25       # the paddle glows while a swing is this recent
+SWING_SLACK_S = 0.1         # the paddle may touch the ball this long before/after the stroke
 
 # The paddle is drawn in the hand: the handle runs from the wrist out along the
 # hand, and the blade sits on the end of it. Sizes are fractions of frame width.
@@ -81,14 +84,24 @@ HANDLE_LEN = 0.045
 HANDLE_WIDTH = 0.018
 BLADE_RADIUS = 0.06
 
-# Swing threshold on |gyro| (x, y, z combined, roughly deg/s). Press `c` in
-# game to measure your own swing and set it from that.
-SWING_THRESHOLD = 150.0
-CALIBRATE_S = 2.0
-CALIBRATE_FRACTION = 0.4    # threshold = this fraction of your calibration peak
-# In --sim there is no gyro, so swing speed is the wrist's speed on screen,
-# in frame widths per second.
-SIM_SWING_THRESHOLD = 1.2
+# What counts as a swing. A real stroke turns the paddle one way, without
+# reversing, through a decent angle, and the arm moves while it does. Shaking
+# the hub fails on both counts: it reverses every few hundredths of a second,
+# so no single turn adds up to much, and the wrist hardly moves on screen.
+SWING_ANGLE = 50.0          # degrees the paddle must turn in one stroke (`c` sets this)
+SWING_MIN_S = 0.08          # ...over at least this long
+SWING_TRAVEL = 0.06         # ...while the wrist moves this far (frame widths)
+GYRO_FLOOR = 30.0           # |rotation| below this (deg/s) is "not turning"
+SAME_WAY_COS = 0.5          # rotation within 60 deg of the stroke's direction is "the same way"
+GYRO_RATE_HZ = 100          # gyro is sampled on its own thread, not once per frame
+STROKE_LOOKBACK_S = 0.6     # how far back to look for strokes
+CALIBRATE_S = 3.0
+CALIBRATE_FRACTION = 0.5    # threshold = this fraction of your biggest calibration swing
+# In --sim there is no gyro: a swing is the wrist moving one way across the
+# screen, at least this far (frame widths) within SIM_STROKE_S. Waggling it
+# back and forth goes nowhere, so it doesn't count either.
+SIM_SWING_TRAVEL = 0.15
+SIM_STROKE_S = 0.35
 
 # --- table geometry --------------------------------------------------------
 # A real pinhole projection, so the table lies flat on its plane. World units
@@ -109,8 +122,12 @@ TABLE_ALPHA = 0.6           # how solid the table is over the camera image (0..1
 
 COUNTDOWN_S = 3.0
 GAME_OVER_S = 2.5
-BUZZ_MS = 90                # haptic buzz on a hit
-BUZZ_SPEED = 70
+# Haptics: the hub has no vibration motor, so the buzz is the drive motors
+# wiggling back and forth at full speed and braking hard. Each step is
+# (direction, milliseconds); +1 clockwise, -1 counter-clockwise.
+BUZZ_SPEED = 100
+HIT_BUZZ = [(+1, 35), (-1, 35)] * 3            # a short, sharp jolt
+MISS_BUZZ = [(+1, 70), (-1, 70)] * 4           # a longer, heavier rumble
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 LM = mp.solutions.pose.PoseLandmark
@@ -150,6 +167,7 @@ class Paddle:
         self.card_serial = card_serial
         self.buzz_enabled = buzz
         self.hub = None
+        self._buzzing = threading.Lock()
 
     def connect(self):
         if not self.enabled:
@@ -158,27 +176,59 @@ class Paddle:
         print("[paddle] searching for the Double Motor over Bluetooth...")
         self.hub = doubleMotor()
         self.hub.connect(card_serial=self.card_serial, card_color=self.card_color)
+        # Brake rather than coast at the end of a buzz: the sudden stop is
+        # most of what you feel.
+        self.hub.motor_set_end_state(le.MOTOR_END_STATE_BRAKE, motor=le.MOTOR_BOTH)
         print("[paddle] connected")
 
-    def gyro_magnitude(self):
-        """|gyro| across all three axes, or 0 before the first IMU report."""
+    def gyro(self):
+        """(x, y, z) rotation rate, or None before the first IMU report."""
         imu = self.hub.imu_device
         g = (imu.gyroscopeX, imu.gyroscopeY, imu.gyroscopeZ)
-        if any(math.isnan(v) for v in g):
-            return 0.0
-        return math.sqrt(sum(v * v for v in g))
+        return None if any(math.isnan(v) for v in g) else g
 
-    def buzz(self, ms=BUZZ_MS):
+    def sample_gyro(self, swing, stop):
+        """Feed the gyro into `swing` at GYRO_RATE_HZ until `stop` is set.
+
+        Sampling once per camera frame (~25 Hz) is too coarse: a quick shake
+        can alias into what looks like one long turn. This only reads values
+        the BLE thread already received, so it never talks to the hub.
+        """
+        while not stop.wait(1.0 / GYRO_RATE_HZ):
+            g = self.gyro()
+            if g is not None:
+                swing.add_gyro(time.monotonic(), g)
+
+    def buzz(self, pattern=HIT_BUZZ):
+        """Play a buzz pattern without holding up the game loop.
+
+        It runs on its own thread, and only one at a time: two threads
+        writing to the hub at once can drop the Bluetooth connection, so a
+        buzz requested while another is still playing is skipped.
+        """
         if self.hub is None or not self.buzz_enabled:
             return
+        if not self._buzzing.acquire(blocking=False):
+            return
+        threading.Thread(target=self._play, args=(pattern,), daemon=True).start()
+
+    def _play(self, pattern):
         try:
-            self.hub.motor_run_for_time(ms, motor=le.MOTOR_BOTH, speed=BUZZ_SPEED,
-                                        blocking=False)
+            for direction, ms in pattern:
+                self.hub.motor_run(
+                    direction=(le.MOTOR_MOVE_DIRECTION_CLOCKWISE if direction > 0
+                               else le.MOTOR_MOVE_DIRECTION_COUNTERCLOCKWISE),
+                    motor=le.MOTOR_BOTH, speed=BUZZ_SPEED, blocking=False)
+                time.sleep(ms / 1000)
+            self.hub.motor_stop(motor=le.MOTOR_BOTH, blocking=False)
         except Exception as e:  # a dropped buzz must never end the rally
             print(f"[paddle] buzz failed: {e}")
+        finally:
+            self._buzzing.release()
 
     def close(self):
         if self.hub is not None:
+            self._buzzing.acquire(timeout=1.0)    # let a buzz in progress finish
             try:
                 self.hub.motor_stop(motor=le.MOTOR_BOTH)
                 self.hub.disconnect()
@@ -218,22 +268,116 @@ class Scoreboard:
 
 
 class SwingMeter:
-    """Rolling history of swing speed, so a hit can look back at the peak."""
+    """Recent gyro and wrist history, and whether it adds up to a real swing.
 
-    def __init__(self, keep_s=2.0):
-        self.keep_s = keep_s
-        self.samples = collections.deque()
+    A stroke is a run of gyro samples turning the same way, never dropping
+    below GYRO_FLOOR or swinging round to a different direction. "The same
+    way" is measured on the whole rotation vector, not axis by axis, so a
+    swing that turns the hub about two axes at once still counts in full; a
+    shake reverses the vector and so splits into many small strokes. Its
+    angle is |rotation| integrated over the run. It counts as a swing if the
+    angle, the duration and the wrist's travel on screen during it are all
+    big enough.
+    """
 
-    def add(self, t, value):
-        self.samples.append((t, value))
-        while self.samples and self.samples[0][0] < t - self.keep_s:
-            self.samples.popleft()
+    def __init__(self, sim):
+        self.sim = sim
+        self.gyro = collections.deque()    # (t, (gx, gy, gz)), from the sampler thread
+        self.wrist = collections.deque()   # (t, x, y), in frame widths
+        self.lock = threading.Lock()
 
-    def peak(self, now, window):
-        return max((v for t, v in self.samples if t >= now - window), default=0.0)
+    def add_gyro(self, t, g):
+        with self.lock:
+            self.gyro.append((t, g))
+            while self.gyro and self.gyro[0][0] < t - 2.0:
+                self.gyro.popleft()
 
-    def latest(self):
-        return self.samples[-1][1] if self.samples else 0.0
+    def add_wrist(self, t, x, y):
+        with self.lock:
+            self.wrist.append((t, x, y))
+            while self.wrist and self.wrist[0][0] < t - 2.0:
+                self.wrist.popleft()
+
+    def _travel(self, t0, t1):
+        """How far the wrist moved between t0 and t1 (bounding-box diagonal)."""
+        pts = [(x, y) for t, x, y in self.wrist if t0 - 0.05 <= t <= t1 + 0.05]
+        if len(pts) < 2:
+            return 0.0
+        xs, ys = zip(*pts)
+        return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+    def strokes(self, now):
+        """Strokes in the last STROKE_LOOKBACK_S, as dicts of angle (degrees,
+        or frame widths in --sim), duration, travel and end time."""
+        with self.lock:
+            if self.sim:
+                return self._sim_strokes(now)
+            samples = [s for s in self.gyro if s[0] >= now - STROKE_LOOKBACK_S]
+            runs = []
+            run = None            # [angle, start, end, summed rotation vector]
+            prev_t = None
+            for t, g in samples:
+                dt = t - prev_t if prev_t is not None else 0.0
+                prev_t = t
+                mag = math.sqrt(g[0] ** 2 + g[1] ** 2 + g[2] ** 2)
+                if mag < GYRO_FLOOR:                   # stopped turning
+                    if run is not None:
+                        runs.append(run)
+                    run = None
+                    continue
+                if run is not None:
+                    d = run[3]
+                    cos = (g[0] * d[0] + g[1] * d[1] + g[2] * d[2]) / (
+                        mag * math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2))
+                    if cos >= SAME_WAY_COS:            # still the same stroke
+                        run[0] += mag * dt
+                        run[2] = t
+                        run[3] = (d[0] + g[0], d[1] + g[1], d[2] + g[2])
+                        continue
+                    runs.append(run)                   # changed direction
+                run = [mag * dt, t - dt, t, tuple(g)]  # a new stroke starts
+            if run is not None:
+                runs.append(run)
+            return [{"angle": a, "start": t0, "end": t1, "duration": t1 - t0,
+                     "travel": self._travel(t0, t1)}
+                    for a, t0, t1, _ in runs if a > 1.0]
+
+    def _sim_strokes(self, now):
+        pts = [p for p in self.wrist if p[0] >= now - STROKE_LOOKBACK_S]
+        out = []
+        for i, (t0, x0, y0) in enumerate(pts):
+            for t1, x1, y1 in pts[i + 1:]:
+                if t1 - t0 > SIM_STROKE_S:
+                    break
+                d = math.hypot(x1 - x0, y1 - y0)       # net, so waggling cancels out
+                out.append({"angle": d, "start": t0, "end": t1, "duration": t1 - t0,
+                            "travel": d})
+        return out
+
+    def qualifies(self, stroke, threshold):
+        if self.sim:
+            return stroke["angle"] >= threshold
+        return (stroke["angle"] >= threshold and stroke["duration"] >= SWING_MIN_S
+                and stroke["travel"] >= SWING_TRAVEL)
+
+    def is_swing(self, now, threshold):
+        """True if a qualifying stroke is happening now or ended within SWING_WINDOW_S."""
+        return any(self.qualifies(st, threshold) and st["end"] >= now - SWING_WINDOW_S
+                   for st in self.strokes(now))
+
+    def swung_through(self, now, threshold, touch_times):
+        """True if a qualifying stroke was under way when the paddle touched
+        the ball, give or take SWING_SLACK_S. The paddle sweeps through the
+        ball partway into a stroke, often before the stroke has turned far
+        enough to qualify, so this looks at the whole stroke, not just now."""
+        return any(self.qualifies(st, threshold) and
+                   any(st["start"] - SWING_SLACK_S <= t <= st["end"] + SWING_SLACK_S
+                       for t in touch_times)
+                   for st in self.strokes(now))
+
+    def best(self, now):
+        """The biggest recent stroke (for the meter and the logs), or None."""
+        return max(self.strokes(now), key=lambda st: st["angle"], default=None)
 
 
 class TagReader:
@@ -417,7 +561,7 @@ class Game:
         tx = clamp(cx + random.uniform(-1.4, 1.4) * span, 0.12, 0.88)
         ty = clamp(cy + random.uniform(-0.2, 1.3) * span, 0.30, 0.90)
         self.ball = Ball((tx, ty), now, LEVELS[self.level], incoming=True)
-        self.reached = False          # was the paddle ever on the ball this window?
+        self.touches = []             # when the paddle was on the ball this window
 
     def on_hit(self, now, contact):
         self.streak += 1
@@ -432,7 +576,7 @@ class Game:
 
     def on_miss(self, now, why):
         print(f"[game] miss ({why}) -- streak {self.streak}, record {self.record}")
-        self.paddle.buzz(350)
+        self.paddle.buzz(MISS_BUZZ)
         self.scoreboard.publish(self.record)
         self.flash = (f"MISS: {why}", (0, 0, 255), now + GAME_OVER_S)
         self.set_state(GAME_OVER, now)
@@ -440,11 +584,13 @@ class Game:
     def update(self, now, paddle_xy, swing, torso, w, h):
         """Advance one frame. paddle_xy is in frame fractions, or None."""
         if self.state == CALIBRATING:
-            self.calib_peak = max(self.calib_peak, swing.latest())
+            best = swing.best(now)
+            if best is not None:
+                self.calib_peak = max(self.calib_peak, best["angle"])
             if now - self.state_since >= CALIBRATE_S:
                 if self.calib_peak > 0:
                     self.swing_threshold = CALIBRATE_FRACTION * self.calib_peak
-                    print(f"[game] swing peak {self.calib_peak:.1f} -> "
+                    print(f"[game] biggest swing {self.calib_peak:.1f} -> "
                           f"threshold {self.swing_threshold:.1f}")
                 self.set_state(WAITING, now)
             return
@@ -471,18 +617,27 @@ class Game:
         if now < ball.arrival - EARLY_S:
             return
         if now > ball.arrival + LATE_S:
-            if self.reached:
+            if self.touches:
                 why = "no swing"
+                best = swing.best(now)
+                if best is not None:
+                    timing = (" -- but not while the paddle was on the ball"
+                              if swing.qualifies(best, self.swing_threshold) else "")
+                    print(f"[game] best stroke: {best['angle']:.0f} (need "
+                          f"{self.swing_threshold:.0f}) over {best['duration']:.2f} s, "
+                          f"wrist moved {best['travel']:.2f}{timing}")
             elif paddle_xy is None:
                 why = "can't see you"
             else:
                 why = "too far"
             self.on_miss(now, why)
             return
+        # Swinging through the ball: the paddle touches it partway into the
+        # stroke, so remember every touch and check them against whole strokes.
         if paddle_xy is not None and self._near(paddle_xy, ball, now, w, h):
-            self.reached = True
-            if swing.peak(now, SWING_WINDOW_S) >= self.swing_threshold:
-                self.on_hit(now, ball.target)
+            self.touches.append(now)
+        if self.touches and swing.swung_through(now, self.swing_threshold, self.touches):
+            self.on_hit(now, ball.target)
 
     @staticmethod
     def _near(paddle_xy, ball, now, w, h):
@@ -589,8 +744,9 @@ def draw_paddle(frame, paddle, swinging):
     cv2.circle(frame, (cx, cy), r, (25, 25, 25), -1, cv2.LINE_AA)    # wood edge
     cv2.circle(frame, (cx, cy), r - 4, (40, 40, 200), -1, cv2.LINE_AA)  # red rubber
     cv2.circle(frame, (cx, cy), int(r * 0.78), (30, 30, 170), 1, cv2.LINE_AA)
-    hl = (int(cx - dx * r * 0.35 + nx * r * 0.35), int(cy - dy * r * 0.35 + ny * r * 0.35))
-    cv2.circle(frame, hl, max(2, r // 6), (110, 110, 255), -1, cv2.LINE_AA)  # sheen
+    shine_r = max(2, r - 9)                                          # rim shine
+    cv2.ellipse(frame, (cx, cy), (shine_r, shine_r), 0, 200, 250, (110, 110, 245), 3,
+                cv2.LINE_AA)
 
 
 # --- drawing ---------------------------------------------------------------
@@ -675,7 +831,7 @@ def draw_hud(frame, game, paddle, swing, now, sim, tags):
 
     # The paddle goes under the ball, so you can see the ball meet it.
     if paddle is not None:
-        draw_paddle(frame, paddle, swing.peak(now, SWING_WINDOW_S) >= game.swing_threshold)
+        draw_paddle(frame, paddle, swing.is_swing(now, game.swing_threshold))
 
     # The net hides a ball that is still on the far side of it.
     ball = game.ball if game.state == PLAYING else None
@@ -698,17 +854,23 @@ def draw_hud(frame, game, paddle, swing, now, sim, tags):
     text(frame, "SIM (wrist speed)" if sim else "HUB gyro", (14, 144), 0.5,
          (0, 165, 255) if sim else (0, 200, 0), 1)
 
-    # Swing meter: live value against the threshold.
+    # Swing meter: the biggest recent stroke against the threshold.
+    best = swing.best(now)
+    angle = best["angle"] if best else 0.0
     mx, my, mw, mh = 14, h - 40, 260, 18
     top = max(game.swing_threshold * 2.5, 1e-6)
-    fill = int(mw * clamp(swing.latest() / top, 0, 1))
+    fill = int(mw * clamp(angle / top, 0, 1))
+    ok = best is not None and swing.qualifies(best, game.swing_threshold)
     cv2.rectangle(frame, (mx, my), (mx + mw, my + mh), (60, 60, 60), -1)
-    cv2.rectangle(frame, (mx, my), (mx + fill, my + mh), (0, 200, 255), -1)
+    cv2.rectangle(frame, (mx, my), (mx + fill, my + mh), (0, 220, 0) if ok else (0, 200, 255), -1)
     tx = mx + int(mw / 2.5)
     cv2.line(frame, (tx, my - 4), (tx, my + mh + 4), (255, 255, 255), 2)
-    unit = "w/s" if sim else "dps"
-    text(frame, f"swing {swing.latest():.1f} / {game.swing_threshold:.1f} {unit}",
-         (mx, my - 8), 0.5, (255, 255, 255), 1)
+    if sim:
+        label = f"swing {angle:.2f} / {game.swing_threshold:.2f} widths"
+    else:
+        arm = "arm moving" if best and best["travel"] >= SWING_TRAVEL else "arm still"
+        label = f"swing {angle:.0f} / {game.swing_threshold:.0f} deg  ({arm})"
+    text(frame, label, (mx, my - 8), 0.5, (255, 255, 255), 1)
 
     # State banner.
     if game.state == WAITING:
@@ -717,7 +879,7 @@ def draw_hud(frame, game, paddle, swing, now, sim, tags):
         left = COUNTDOWN_S - (now - game.state_since)
         centred(frame, str(max(1, math.ceil(left))), int(h * 0.55), 3.0, (0, 255, 255))
     elif game.state == CALIBRATING:
-        centred(frame, f"SWING HARD!  peak {game.calib_peak:.1f}", int(h * 0.55), 1.1,
+        centred(frame, f"TAKE 2-3 REAL SWINGS!  best {game.calib_peak:.0f}", int(h * 0.55), 1.1,
                 (0, 255, 255))
     if game.flash and now < game.flash[2]:
         centred(frame, game.flash[0], int(h * 0.42), 1.6, game.flash[1])
@@ -764,7 +926,7 @@ def open_camera(index, width=1280, height=720):
 
 def main():
     ap = argparse.ArgumentParser(description="Virtual ping-pong with a LEGO Double Motor paddle.")
-    ap.add_argument("--sim", action="store_true", help="no hub: use wrist speed as the swing signal")
+    ap.add_argument("--sim", action="store_true", help="no hub: use wrist movement as the swing signal")
     ap.add_argument("--name", default="Tyler", help="MQTT topic is ME193/Rogers/<name>")
     ap.add_argument("--broker", default="test.mosquitto.org")
     ap.add_argument("--no-mqtt", action="store_true", help="don't publish the score")
@@ -773,7 +935,7 @@ def main():
     ap.add_argument("--card-serial", default=None, help="Connection Card serial, e.g. 1129")
     ap.add_argument("--hand", choices=["right", "left"], default="right", help="paddle hand")
     ap.add_argument("--swing-threshold", type=float, default=None,
-                    help=f"|gyro| that counts as a swing (default {SWING_THRESHOLD})")
+                    help=f"degrees one stroke must turn the paddle (default {SWING_ANGLE:.0f})")
     ap.add_argument("--no-buzz", action="store_true", help="don't buzz the motors on a hit")
     ap.add_argument("--camera", type=int, default=None,
                     help="OpenCV camera index (default: the Mac's built-in camera)")
@@ -799,10 +961,14 @@ def main():
 
     threshold = args.swing_threshold
     if threshold is None:
-        threshold = SIM_SWING_THRESHOLD if args.sim else SWING_THRESHOLD
+        threshold = SIM_SWING_TRAVEL if args.sim else SWING_ANGLE
     game = Game(paddle, scoreboard, threshold)
     tags = TagReader()
-    swing = SwingMeter()
+    swing = SwingMeter(args.sim)
+    stop_sampler = threading.Event()
+    if not args.sim:
+        threading.Thread(target=paddle.sample_gyro, args=(swing, stop_sampler),
+                         daemon=True).start()
 
     camera = args.camera
     if camera is None and not args.pick_camera:
@@ -817,7 +983,6 @@ def main():
     print(f"[camera] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
           f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     hand = args.hand
-    last_paddle = None
     torso = (0.5, 0.45, 0.2)        # sensible default until we first see shoulders
     bad_reads = 0
     print("Show tag 1-5 to pick a level, tag 0 (or space) to start. q to quit.")
@@ -836,11 +1001,11 @@ def main():
             # AprilTags are read off the raw frame: mirrored, they don't decode.
             seen = []
             if game.state in (WAITING, GAME_OVER):
-                held, seen = tags.read(raw, now)
-                if held == START_TAG:
+                tag, seen = tags.read(raw, now)
+                if tag == START_TAG:
                     game.start(now)
-                elif held in LEVELS:
-                    game.set_level(held, now)
+                elif tag in LEVELS:
+                    game.set_level(tag, now)
 
             # Pose runs on the raw frame too, then gets mirrored (see mirror()).
             ts_ms = int(time.time() * 1000) - start_ms
@@ -859,17 +1024,10 @@ def main():
                     torso = seen_torso
             paddle_xy = held["center"] if held is not None else None
 
-            # Swing signal: the hub's gyro, or in --sim the paddle's screen speed.
-            if args.sim:
-                speed = 0.0
-                if paddle_xy is not None and last_paddle is not None:
-                    (x0, y0, t0), (x1, y1) = last_paddle, paddle_xy
-                    if now > t0:
-                        speed = math.hypot(x1 - x0, (y1 - y0) * h / w) / (now - t0)
-                swing.add(now, speed)
-                last_paddle = (*paddle_xy, now) if paddle_xy is not None else None
-            else:
-                swing.add(now, paddle.gyro_magnitude())
+            # The gyro feeds `swing` on its own thread; the wrist comes from pose.
+            if held is not None:
+                wx, wy = held["wrist"]
+                swing.add_wrist(now, wx / w, wy / w)
 
             game.update(now, paddle_xy, swing, torso, w, h)
 
@@ -894,6 +1052,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop_sampler.set()
         paddle.close()
         scoreboard.close()
         cap.release()
