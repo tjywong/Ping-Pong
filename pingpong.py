@@ -14,8 +14,11 @@ AprilTags (tag36h11) run the game from across the room, no keyboard needed:
   - tag 1..5   pick the player level, which sets the ball speed
   - tag 0      start the game (a short countdown, then the first serve)
 
-The record number of continuous hits is published live over MQTT to
-ME193/Rogers/<name> as a floating point number, e.g. "12.0".
+The score is published live over MQTT as floating point numbers:
+
+  - ME193/Rogers/<name>          your current run of continuous hits, e.g. "7.0",
+                                 updated on every hit and back to "0.0" on a miss
+  - ME193/Rogers/<name>/record   your record run of continuous hits
 
     source .venv/bin/activate
     python pingpong.py                        # connect to the hub and play
@@ -237,7 +240,8 @@ class Paddle:
 
 
 class Scoreboard:
-    """Publishes the record streak to ME193/Rogers/<name> as a float."""
+    """Publishes the live streak to ME193/Rogers/<name> and the record to
+    ME193/Rogers/<name>/record, both as floats."""
 
     def __init__(self, name, broker, enabled=True):
         self.topic = f"ME193/Rogers/{name}"
@@ -248,7 +252,8 @@ class Scoreboard:
         try:
             self.client = MQTTClient(broker=broker)
             self.client.connect()
-            print(f"[mqtt] publishing record to {broker} topic {self.topic}")
+            print(f"[mqtt] publishing to {broker}: live streak on {self.topic}, "
+                  f"record on {self.topic}/record")
         except Exception as e:
             self.client = None
             print(f"[mqtt] could not reach {broker} ({e}); playing offline")
@@ -257,10 +262,11 @@ class Scoreboard:
     def online(self):
         return self.client is not None
 
-    def publish(self, record):
+    def publish(self, streak, record):
         if self.client is not None:
-            # Retained, so anyone who subscribes later still sees the record.
-            self.client.publish(self.topic, str(float(record)), retain=True)
+            # Retained, so anyone who subscribes later sees the current values.
+            self.client.publish(self.topic, str(float(streak)), retain=True)
+            self.client.publish(f"{self.topic}/record", str(float(record)), retain=True)
 
     def close(self):
         if self.client is not None:
@@ -527,7 +533,7 @@ class Game:
         self.ball = None
         self.flash = None             # (text, colour, until)
         self.calib_peak = 0.0
-        self.scoreboard.publish(self.record)
+        self.scoreboard.publish(self.streak, self.record)
 
     def set_state(self, state, now):
         self.state, self.state_since = state, now
@@ -540,6 +546,7 @@ class Game:
     def start(self, now):
         if self.state in (WAITING, GAME_OVER):
             self.streak = 0
+            self.scoreboard.publish(self.streak, self.record)
             self.ball = None
             self.set_state(COUNTDOWN, now)
             print(f"[game] starting at level {self.level}")
@@ -552,7 +559,7 @@ class Game:
     def reset_record(self, now):
         self.record = 0
         save_record(0)
-        self.scoreboard.publish(0)
+        self.scoreboard.publish(self.streak, 0)
         self.flash = ("RECORD RESET", (200, 200, 200), now + 1.2)
 
     def serve(self, now, torso):
@@ -569,7 +576,7 @@ class Game:
         if self.streak > self.record:
             self.record = self.streak
             save_record(self.record)
-        self.scoreboard.publish(self.record)
+        self.scoreboard.publish(self.streak, self.record)
         # Send it back the way it came; the opponent returns it on arrival.
         self.ball = Ball(contact, now, LEVELS[self.level] * 0.8, incoming=False)
         self.flash = ("HIT!", (0, 255, 0), now + 0.4)
@@ -577,7 +584,8 @@ class Game:
     def on_miss(self, now, why):
         print(f"[game] miss ({why}) -- streak {self.streak}, record {self.record}")
         self.paddle.buzz(MISS_BUZZ)
-        self.scoreboard.publish(self.record)
+        self.streak = 0               # the run is over
+        self.scoreboard.publish(self.streak, self.record)
         self.flash = (f"MISS: {why}", (0, 0, 255), now + GAME_OVER_S)
         self.set_state(GAME_OVER, now)
 

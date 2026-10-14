@@ -9,7 +9,7 @@ flies at you down the on-screen table.
 | **Pose** (MediaPipe, webcam) | Draws a ping-pong paddle in your right hand (handle at the wrist, pointing along your hand). The ball only counts as reached if it touches the paddle's blade. |
 | **IMU** (the hub's gyroscope) | Detects whether you are actually swinging. Holding still in the right spot is a miss, and so is shaking the hub. |
 | **AprilTags** (tag36h11) | Tags **1–5** pick the player level (ball speed). Tag **0** starts the game. |
-| **MQTT** | The record number of continuous hits is published live to `ME193/Rogers/Tyler` on `test.mosquitto.org` as a float (e.g. `12.0`), retained. |
+| **MQTT** | Your live streak of continuous hits is published to `ME193/Rogers/Tyler` on `test.mosquitto.org` as a float (`1.0`, `2.0`, …, back to `0.0` on a miss). Your record goes to `ME193/Rogers/Tyler/record`. Both are retained. |
 
 A hit needs both at once: the paddle within reach of the ball **and** a real
 swing, inside a window from 0.25 s before the ball arrives to 0.15 s after.
@@ -98,15 +98,15 @@ the motor shafts, such as a wheel or an off-centre beam.
 
 ## Watching the score
 
-`score_viewer.py` opens a window that shows what arrives over MQTT: the
-latest score in large type (it flashes green when it changes) and a log of
-recent messages. The record is published retained, so it shows up the moment
-the viewer connects. Run it alongside the game, or on another laptop:
+`score_viewer.py` opens a window that shows what arrives over MQTT: your live
+streak in large type (it flashes green when it changes), your record under
+it, and a log of recent messages. Both are published retained, so they show
+up the moment the viewer connects. Run it alongside the game, or on another laptop:
 
 ```bash
 python score_viewer.py                # ME193/Rogers/Tyler
 python score_viewer.py --name Alex    # someone else
-python score_viewer.py --all          # leaderboard of everyone under ME193/Rogers/
+python score_viewer.py --all          # everyone's live score under ME193/Rogers/
 ```
 
 The record is also saved to `record.json`, so it survives restarts.
@@ -114,7 +114,7 @@ The record is also saved to `record.json`, so it survives restarts.
 ## Files
 
 - `pingpong.py`: the game
-- `score_viewer.py`: test window that shows the score arriving over MQTT
+- `score_viewer.py`: test window that shows the live score and record arriving over MQTT
 - `lelib.py`, `mqttlib.py`, `camlib.py`: ME193 class libraries (hub, MQTT, camera picker)
 - `tags/`: printable AprilTags 0–5
 

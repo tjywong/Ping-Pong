@@ -1,9 +1,10 @@
 """Test window for the ping-pong score: shows what arrives over MQTT.
 
-Subscribes to the topic pingpong.py publishes to (ME193/Rogers/<name>) and
-displays each message as it lands -- the latest value big, plus a log of
-recent messages with the time they arrived. The record is published retained,
-so the current value shows up as soon as this connects, even mid-game.
+Subscribes to the topics pingpong.py publishes to and displays each message
+as it lands: the live streak (ME193/Rogers/<name>) big, the record
+(ME193/Rogers/<name>/record) under it, and a log of recent messages with the
+time they arrived. Both are published retained, so the current values show up
+as soon as this connects, even mid-game.
 
     source .venv/bin/activate
     python score_viewer.py                    # ME193/Rogers/Tyler
@@ -58,7 +59,10 @@ def main():
     # mqttlib routes callbacks by exact topic string, which never matches a
     # wildcard; hook paho directly so `#` works too.
     client._client.on_message = lambda c, u, msg: on_message(msg.topic, msg.payload.decode())
-    client._client.subscribe(topic)
+    if args.all:
+        client._client.subscribe(topic)
+    else:
+        client._client.subscribe([(topic, 0), (f"{topic}/record", 0)])
     print(f"[viewer] {args.broker}: listening on {topic}")
 
     try:
@@ -73,11 +77,18 @@ def main():
             if not entries:
                 text(img, "waiting for a message...", (20, 150), 0.9, (150, 150, 150), 2)
             elif not args.all:
-                payload, at = entries[0][1]
-                fresh = time.time() - at < 1.0          # flash green when it changes
-                text(img, payload, (20, 190), 3.0, (0, 255, 0) if fresh else (0, 255, 255), 6)
-                text(img, f"record   (updated {time.strftime('%H:%M:%S', time.localtime(at))})",
-                     (24, 225), 0.55, (180, 180, 180))
+                with lock:
+                    live = latest.get(topic)
+                    best = latest.get(f"{topic}/record")
+                if live is not None:
+                    payload, at = live
+                    fresh = time.time() - at < 1.0      # flash green when it changes
+                    text(img, payload, (20, 180), 3.0, (0, 255, 0) if fresh else (0, 255, 255), 6)
+                    text(img, f"live streak   (updated "
+                              f"{time.strftime('%H:%M:%S', time.localtime(at))})",
+                         (24, 208), 0.55, (180, 180, 180))
+                if best is not None:
+                    text(img, f"record  {best[0]}", (24, 238), 0.7, (255, 255, 255), 2)
             else:
                 # Leaderboard: highest score first; anything that isn't a number last.
                 def score(kv):
@@ -85,14 +96,16 @@ def main():
                         return -float(kv[1][0])
                     except ValueError:
                         return float("inf")
-                for n, (t, (payload, at)) in enumerate(sorted(entries, key=score)[:5]):
+                # One row per player: their live topic, not the /record ones.
+                players = [kv for kv in entries if kv[0].count("/") == 2]
+                for n, (t, (payload, at)) in enumerate(sorted(players, key=score)[:5]):
                     y = 110 + n * 34
                     fresh = time.time() - at < 1.0
                     text(img, t.removeprefix("ME193/Rogers/"), (24, y), 0.75)
                     text(img, payload, (300, y), 0.75, (0, 255, 0) if fresh else (0, 255, 255), 2)
 
-            cv2.line(img, (20, 250), (W - 20, 250), (80, 80, 80), 1)
-            text(img, "recent messages", (20, 274), 0.5, (150, 150, 150))
+            cv2.line(img, (20, 256), (W - 20, 256), (80, 80, 80), 1)
+            text(img, "recent messages", (20, 278), 0.5, (150, 150, 150))
             for n, (at, t, payload) in enumerate(rows):
                 y = 300 + n * 18
                 if y > H - 8:
