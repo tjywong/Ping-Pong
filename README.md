@@ -6,7 +6,7 @@ flies at you down the on-screen table.
 
 | Input | What it does |
 |---|---|
-| **Pose** (MediaPipe, webcam) | Places the paddle: your wrist, extended a little past it along the forearm to where the hub sits. The ball only counts as reached if the paddle circle is on it. |
+| **Pose** (MediaPipe, webcam) | Draws a ping-pong paddle in your right hand (handle at the wrist, pointing along your hand). The ball only counts as reached if it touches the paddle's blade. |
 | **IMU** (the hub's gyroscope) | Detects whether you are actually swinging. Holding still in the right spot is a miss. |
 | **AprilTags** (tag36h11) | Tags **1–5** pick the player level (ball speed). Tag **0** starts the game. |
 | **MQTT** | The record number of continuous hits is published live to `ME193/Rogers/Tyler` on `test.mosquitto.org` as a float (e.g. `12.0`), retained. |
@@ -26,8 +26,9 @@ to 0.15 s after. On a miss the game tells you why (`too far`, `no swing`,
 | 4 | 4 | 1.05 |
 | 5 | 5 | 0.85 |
 
-Printable tags are in [`tags/`](tags/). Hold one up to the camera for about
-half a second. It needs a white border around it to be detected.
+Printable tags are in [`tags/`](tags/). Hold one up to the camera until the
+bar above it fills (about half a second). It needs a white border around it
+to be detected. Each tag the camera sees is logged as `[tags] saw tag N`.
 
 ## Setup
 
@@ -51,12 +52,16 @@ python pingpong.py --card-color orange --card-serial 1129   # a specific hub
 python pingpong.py --name Tyler   # MQTT topic ME193/Rogers/<name>
 ```
 
-When `pingpong.py` starts, it asks which camera to use. Then:
+It uses the Mac's built-in FaceTime camera. Add `--pick-camera` to choose
+from live previews instead, or `--camera N` to give an OpenCV index directly.
+(With an iPhone attached over Continuity Camera, OpenCV numbers the iPhone 0
+and the built-in camera 1. The game looks the built-in one up by name, so you
+don't need to know this.) Then:
 
 1. **Calibrate** (recommended the first time): press `c` and swing hard for
    2 seconds. The swing threshold is set to 40% of your peak. The meter at
    the bottom-left shows the live swing value against the threshold, and the
-   paddle circle turns green while you're swinging.
+   paddle glows green while you're swinging.
 2. Show a level tag (1–5), then tag 0. After a 3-second countdown the first ball is served.
 
 Keys: `space` start · `1`–`5` level · `c` calibrate swing · `h` switch
@@ -86,4 +91,9 @@ The record is also saved to `record.json`, so it survives restarts.
   install `opencv-python`.
 - AprilTags are detected on the raw camera frame. The display is mirrored, and a
   mirrored tag doesn't decode.
+- The table is a regulation 2.74 m × 1.525 m table drawn with a real
+  perspective projection. In `pingpong.py`, `EYE_HEIGHT` sets how flat it
+  looks (lower is flatter), `TABLE_NEAR` sets how far away it is, and
+  `TABLE_ALPHA` sets how solid it is over the camera image (0 = invisible,
+  1 = solid).
 - The first run triggers macOS's camera permission prompt for your terminal.

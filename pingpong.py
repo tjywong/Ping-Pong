@@ -20,6 +20,7 @@ ME193/Rogers/<name> as a floating point number, e.g. "12.0".
     python pingpong.py                        # connect to the hub and play
     python pingpong.py --sim                  # no hub: wrist speed stands in for the gyro
     python pingpong.py --card-color orange --card-serial 1129
+    python pingpong.py --pick-camera          # choose a camera instead of the built-in one
 
 Keys while the game window has focus:
     space   start (same as tag 0)        1-5   pick level (same as tags 1-5)
@@ -34,6 +35,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import time
 import urllib.request
 
@@ -64,14 +66,20 @@ START_TAG = 0
 # Player level -> seconds the ball takes to travel the length of the table.
 LEVELS = {1: 2.0, 2: 1.6, 3: 1.3, 4: 1.05, 5: 0.85}
 TAG_HOLD_S = 0.4            # a tag must stay in view this long to count
-TAG_DETECT_WIDTH = 960      # detect on a downscaled copy: 1080p is too slow
+TAG_DROPOUT_S = 0.35        # ...but may drop out of detection this long without resetting
+TAG_DETECT_WIDTH = 1280     # only downscale frames wider than this (1080p is too slow)
 
 # --- hitting ---------------------------------------------------------------
-HIT_RADIUS = 0.09           # paddle reach, as a fraction of frame width
+HIT_RADIUS = 0.09           # paddle reach (blade + ball), as a fraction of frame width
 EARLY_S = 0.25              # a hit may land this long before the ball arrives...
 LATE_S = 0.15               # ...or this long after
 SWING_WINDOW_S = 0.25       # the swing must peak within this long of contact
-PADDLE_REACH = 0.35         # the hub sits past the wrist: wrist + 0.35*(wrist-elbow)
+
+# The paddle is drawn in the hand: the handle runs from the wrist out along the
+# hand, and the blade sits on the end of it. Sizes are fractions of frame width.
+HANDLE_LEN = 0.045
+HANDLE_WIDTH = 0.018
+BLADE_RADIUS = 0.06
 
 # Swing threshold on |gyro| (x, y, z combined, roughly deg/s). Press `c` in
 # game to measure your own swing and set it from that.
@@ -82,11 +90,22 @@ CALIBRATE_FRACTION = 0.4    # threshold = this fraction of your calibration peak
 # in frame widths per second.
 SIM_SWING_THRESHOLD = 1.2
 
-# --- table geometry (fractions of the frame) -------------------------------
-VANISH = (0.5, 0.14)        # far end of the table, where serves come from
-FAR_DEPTH = 6.0             # ball starts 6x further away than the contact plane
-BALL_RADIUS = 0.035         # apparent ball radius at the contact plane
-ARC = 0.10                  # height of the ball's arc over the net
+# --- table geometry --------------------------------------------------------
+# A real pinhole projection, so the table lies flat on its plane. World units
+# are metres: x to the right, y up from the table top, z away from the screen.
+FOCAL = 0.9                 # focal length, in frame widths
+HORIZON = 0.42              # horizon height on screen, as a fraction of frame height
+EYE_HEIGHT = 0.50           # camera height above the table top: lower = flatter table
+TABLE_NEAR = 1.7            # distance from the screen to the near edge of the table
+TABLE_LENGTH = 2.74         # regulation table: 2.74 m x 1.525 m, net 15.25 cm
+TABLE_HALF_WIDTH = 0.7625
+TABLE_THICKNESS = 0.04
+NET_HEIGHT = 0.1525
+TABLE_FAR = TABLE_NEAR + TABLE_LENGTH
+NET_Z = TABLE_NEAR + TABLE_LENGTH / 2
+CONTACT_Z = 1.0             # where you hit the ball: just off the near edge
+BALL_SIZE = 0.035           # ball radius (drawn bigger than a real 20 mm ball)
+TABLE_ALPHA = 0.6           # how solid the table is over the camera image (0..1)
 
 COUNTDOWN_S = 3.0
 GAME_OVER_S = 2.5
@@ -218,51 +237,81 @@ class SwingMeter:
 
 
 class TagReader:
-    """Reports a tag id once it has been held in view for TAG_HOLD_S."""
+    """Reports a tag id once it has been held in view for TAG_HOLD_S.
+
+    Detection flickers on a hand-held tag (motion blur, glare, a tilt), so a
+    tag only loses its place in the hold if it goes undetected for longer
+    than TAG_DROPOUT_S, not on the first missed frame.
+    """
 
     def __init__(self):
         self.detector = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(TAG_DICT),
             cv2.aruco.DetectorParameters())
-        self.seen_id = None
-        self.seen_since = 0.0
-        self.fired = False
+        self.first_seen = {}          # tag id -> when this hold began
+        self.last_seen = {}           # tag id -> last frame it was detected
+        self.fired = set()            # ids that already fired during this hold
 
     def read(self, frame, now):
-        """Return (held tag id or None, list of (id, corners) in frame pixels)."""
+        """Return (held tag id or None, [(id, corners in frame pixels, hold 0..1)])."""
         h, w = frame.shape[:2]
         scale = min(1.0, TAG_DETECT_WIDTH / w)
         small = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1 else frame
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.detector.detectMarkers(gray)
-        found = []
+        detected = []
         if ids is not None:
             for c, i in zip(corners, ids.flatten()):
+                i = int(i)
                 if i == START_TAG or i in LEVELS:
-                    found.append((int(i), c.reshape(4, 2) / scale))
+                    detected.append((i, c.reshape(4, 2) / scale))
 
-        # Debounce: the same tag held still for TAG_HOLD_S fires exactly once.
-        current = found[0][0] if found else None
-        if current != self.seen_id:
-            self.seen_id, self.seen_since, self.fired = current, now, False
-        if current is not None and not self.fired and now - self.seen_since >= TAG_HOLD_S:
-            self.fired = True
-            return current, found
-        return None, found
+        for i, _ in detected:
+            if i not in self.last_seen:
+                self.first_seen[i] = now
+                print(f"[tags] saw tag {i}")
+            self.last_seen[i] = now
+        for i in [i for i, t in self.last_seen.items() if now - t > TAG_DROPOUT_S]:
+            del self.last_seen[i], self.first_seen[i]   # gone: showing it again fires again
+            self.fired.discard(i)
+
+        held = None
+        for i in self.last_seen:
+            if i not in self.fired and now - self.first_seen[i] >= TAG_HOLD_S:
+                self.fired.add(i)
+                held = i
+                break
+        found = [(i, c, clamp((now - self.first_seen[i]) / TAG_HOLD_S, 0, 1))
+                 for i, c in detected]
+        return held, found
 
 
 # --- the ball --------------------------------------------------------------
 
-class Ball:
-    """A ball moving between the far end of the table and the contact plane.
+def project(x, y, z, w, h):
+    """World point (metres) -> screen pixels."""
+    f = FOCAL * w
+    z = max(z, 0.2)
+    return w / 2 + f * x / z, HORIZON * h + f * (EYE_HEIGHT - y) / z
 
-    Depth runs from FAR_DEPTH to 1 (incoming) or 1 to FAR_DEPTH (returning),
-    linearly in time; apparent size and distance from the vanishing point
-    both go as 1/depth, which is what makes it look like it is coming at you.
+
+def unproject(px, py, z, w, h):
+    """Screen pixels at depth z -> world point."""
+    f = FOCAL * w
+    return (px - w / 2) * z / f, EYE_HEIGHT - (py - HORIZON * h) * z / f, z
+
+
+class Ball:
+    """A ball in flight over the table, in two legs.
+
+    Incoming: opponent -> bounce on your side -> the contact point.
+    Outgoing: contact point -> bounce on their side -> opponent.
+    Each leg is a straight line in x and z with a parabolic arc in height,
+    and the ball moves at a constant speed along z.
     """
 
     def __init__(self, target, now, duration, incoming=True):
-        self.target = target          # (x, y) in frame fractions at depth 1
+        self.target = target          # contact point on screen, in frame fractions
         self.t0 = now
         self.duration = duration
         self.incoming = incoming
@@ -271,23 +320,48 @@ class Ball:
     def arrival(self):
         return self.t0 + self.duration
 
-    def progress(self, now):
-        return (now - self.t0) / self.duration
+    def _legs(self, w, h):
+        contact = unproject(self.target[0] * w, self.target[1] * h, CONTACT_Z, w, h)
+        cx = contact[0]
+        opponent = (cx * 0.4, 0.30, TABLE_FAR + 0.4)
+        if self.incoming:
+            bounce = (cx * 0.8, 0.0, TABLE_NEAR + 0.25 * TABLE_LENGTH)
+            return [(opponent, bounce, 0.18), (bounce, contact, 0.10)]
+        bounce = (cx * 0.5, 0.0, TABLE_NEAR + 0.78 * TABLE_LENGTH)
+        return [(contact, bounce, 0.20), (bounce, opponent, 0.08)]
+
+    def position(self, now, w, h):
+        """World position; keeps going along the last leg after arrival."""
+        legs = self._legs(w, h)
+        lengths = [abs(b[2] - a[2]) for a, b, _ in legs]
+        d = (now - self.t0) / self.duration * sum(lengths)
+        for n, ((a, b, arc), length) in enumerate(zip(legs, lengths)):
+            if d <= length or n == len(legs) - 1:
+                s = max(0.0, d / length)
+                break
+            d -= length
+        x = a[0] + (b[0] - a[0]) * s
+        y = a[1] + (b[1] - a[1]) * s + arc * 4 * s * (1 - s)
+        z = a[2] + (b[2] - a[2]) * s
+        return x, y, z
 
     def screen(self, now, w, h):
         """Return (x, y, radius) in pixels."""
-        p = self.progress(now)
-        if not self.incoming:
-            p = 1.0 - p
-        depth = max(0.4, FAR_DEPTH - (FAR_DEPTH - 1.0) * p)
-        s_far = 1.0 / FAR_DEPTH
-        k = (1.0 / depth - s_far) / (1.0 - s_far)   # 0 at the far end, 1 at contact
-        vx, vy = VANISH
-        x = vx + (self.target[0] - vx) * k
-        y = vy + (self.target[1] - vy) * k
-        y -= ARC * math.sin(math.pi * clamp(p, 0, 1)) * k   # arc over the net
-        r = BALL_RADIUS * w / depth
-        return int(x * w), int(y * h), max(2, int(r))
+        x, y, z = self.position(now, w, h)
+        px, py = project(x, y, z, w, h)
+        r = FOCAL * w * BALL_SIZE / max(z, 0.2)
+        return int(px), int(py), max(2, int(r))
+
+    def shadow(self, now, w, h):
+        """(x, y, radius) of the ball's shadow on the table, or None if off it."""
+        x, y, z = self.position(now, w, h)
+        if y < 0 or not TABLE_NEAR <= z <= TABLE_FAR or abs(x) > TABLE_HALF_WIDTH:
+            return None
+        px, py = project(x, 0.0, z, w, h)
+        return int(px), int(py), max(2, int(FOCAL * w * BALL_SIZE / z))
+
+    def depth(self, now, w, h):
+        return self.position(now, w, h)[2]
 
 
 # --- the game --------------------------------------------------------------
@@ -424,21 +498,53 @@ def visible(lm, threshold=0.5):
     return getattr(lm, "visibility", 1.0) >= threshold
 
 
-def read_pose(landmarks, hand):
-    """Return (paddle point, torso) in frame fractions; either may be None.
+class Point:
+    __slots__ = ("x", "y", "visibility")
+
+    def __init__(self, x, y, visibility):
+        self.x, self.y, self.visibility = x, y, visibility
+
+
+def mirror(landmarks):
+    """Flip landmarks left-right to match the mirrored display.
+
+    Pose runs on the raw camera frame, where the model's RIGHT_WRIST really is
+    the player's right wrist. Running it on the mirrored frame instead would
+    swap the hands, because a mirrored person looks like one facing the other way.
+    """
+    return [Point(1.0 - lm.x, lm.y, getattr(lm, "visibility", 1.0)) for lm in landmarks]
+
+
+def read_pose(landmarks, hand, w, h):
+    """Return (paddle, torso); either may be None.
+
+    The paddle is a dict: "center" is the blade centre in frame fractions (what
+    the ball has to touch), "wrist" is in pixels, and "dir" is the unit
+    direction the paddle points, wrist to blade, in pixels.
 
     Torso is (centre x, shoulder height, shoulder width) and is what serves
     aim at, so the ball always comes somewhere the player can reach.
     """
-    wrist = landmarks[LM.RIGHT_WRIST if hand == "right" else LM.LEFT_WRIST]
-    elbow = landmarks[LM.RIGHT_ELBOW if hand == "right" else LM.LEFT_ELBOW]
+    side = "RIGHT" if hand == "right" else "LEFT"
+    wrist = landmarks[LM[f"{side}_WRIST"]]
+    elbow = landmarks[LM[f"{side}_ELBOW"]]
+    knuckles = [landmarks[LM[f"{side}_INDEX"]], landmarks[LM[f"{side}_PINKY"]]]
     paddle = None
     if visible(wrist):
-        px, py = wrist.x, wrist.y
-        if visible(elbow):
-            px += PADDLE_REACH * (wrist.x - elbow.x)
-            py += PADDLE_REACH * (wrist.y - elbow.y)
-        paddle = (px, py)
+        wx, wy = wrist.x * w, wrist.y * h
+        # Point along the hand if we can see it, otherwise along the forearm.
+        if all(visible(k, 0.3) for k in knuckles):
+            dx = sum(k.x for k in knuckles) / 2 * w - wx
+            dy = sum(k.y for k in knuckles) / 2 * h - wy
+        elif visible(elbow):
+            dx, dy = wx - elbow.x * w, wy - elbow.y * h
+        else:
+            dx, dy = 0.0, -1.0           # straight up
+        n = math.hypot(dx, dy) or 1.0
+        dx, dy = dx / n, dy / n
+        reach = (HANDLE_LEN + BLADE_RADIUS) * w
+        paddle = {"center": ((wx + dx * reach) / w, (wy + dy * reach) / h),
+                  "wrist": (wx, wy), "dir": (dx, dy)}
 
     torso = None
     ls, rs = landmarks[LM.LEFT_SHOULDER], landmarks[LM.RIGHT_SHOULDER]
@@ -456,26 +562,87 @@ def draw_skeleton(frame, landmarks):
                  (90, 160, 90), 1)
 
 
+def draw_paddle(frame, paddle, swinging):
+    """A ping-pong paddle in the hand: wooden handle, red rubber blade."""
+    w = frame.shape[1]
+    wx, wy = paddle["wrist"]
+    dx, dy = paddle["dir"]
+    nx, ny = -dy, dx                       # across the handle
+    hw = HANDLE_WIDTH * w / 2
+    blade_r = BLADE_RADIUS * w
+    start = (wx - dx * 0.25 * HANDLE_LEN * w, wy - dy * 0.25 * HANDLE_LEN * w)
+    end = (wx + dx * (HANDLE_LEN * w + 0.4 * blade_r), wy + dy * (HANDLE_LEN * w + 0.4 * blade_r))
+    handle = np.array([[start[0] + nx * hw, start[1] + ny * hw],
+                       [end[0] + nx * hw, end[1] + ny * hw],
+                       [end[0] - nx * hw, end[1] - ny * hw],
+                       [start[0] - nx * hw, start[1] - ny * hw]], np.int32)
+    cv2.fillPoly(frame, [handle], (70, 130, 190), cv2.LINE_AA)      # wood
+    cv2.polylines(frame, [handle], True, (30, 60, 100), 2, cv2.LINE_AA)
+    # Grain: a darker stripe down the middle of the handle.
+    cv2.line(frame, (int(start[0]), int(start[1])), (int(end[0]), int(end[1])),
+             (50, 100, 160), 1, cv2.LINE_AA)
+
+    cx, cy = (int(paddle["center"][0] * w), int(paddle["center"][1] * frame.shape[0]))
+    r = int(blade_r)
+    if swinging:                                                     # swing glow
+        cv2.circle(frame, (cx, cy), r + 7, (0, 255, 0), 4, cv2.LINE_AA)
+    cv2.circle(frame, (cx, cy), r, (25, 25, 25), -1, cv2.LINE_AA)    # wood edge
+    cv2.circle(frame, (cx, cy), r - 4, (40, 40, 200), -1, cv2.LINE_AA)  # red rubber
+    cv2.circle(frame, (cx, cy), int(r * 0.78), (30, 30, 170), 1, cv2.LINE_AA)
+    hl = (int(cx - dx * r * 0.35 + nx * r * 0.35), int(cy - dy * r * 0.35 + ny * r * 0.35))
+    cv2.circle(frame, hl, max(2, r // 6), (110, 110, 255), -1, cv2.LINE_AA)  # sheen
+
+
 # --- drawing ---------------------------------------------------------------
 
+def _pts(*world, w, h):
+    return np.array([project(*p, w, h) for p in world], np.int32)
+
+
 def draw_table(frame):
+    """The table top and its front edge, blended over the camera image."""
     h, w = frame.shape[:2]
+    hw, t = TABLE_HALF_WIDTH, TABLE_THICKNESS
+    top = _pts((-hw, 0, TABLE_NEAR), (hw, 0, TABLE_NEAR), (hw, 0, TABLE_FAR),
+               (-hw, 0, TABLE_FAR), w=w, h=h)
+    front = _pts((-hw, 0, TABLE_NEAR), (hw, 0, TABLE_NEAR), (hw, -t, TABLE_NEAR),
+                 (-hw, -t, TABLE_NEAR), w=w, h=h)
     overlay = frame.copy()
-    vx, vy = VANISH
-    far_half = 0.12
-    pts = np.array([[(vx - far_half) * w, vy * h], [(vx + far_half) * w, vy * h],
-                    [0.98 * w, 0.98 * h], [0.02 * w, 0.98 * h]], np.int32)
-    cv2.fillPoly(overlay, [pts], (90, 50, 10))
-    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
-    cv2.polylines(frame, [pts], True, (255, 255, 255), 2)
-    cv2.line(frame, (int(vx * w), int(vy * h)), (int(vx * w), int(0.98 * h)),
-             (255, 255, 255), 1)
-    # The net, about a third of the way down in screen space.
-    k = 0.28
-    ny = int((vy + (0.98 - vy) * k) * h)
-    nx0 = int(((vx - far_half) + ((0.02) - (vx - far_half)) * k) * w)
-    nx1 = int(((vx + far_half) + ((0.98) - (vx + far_half)) * k) * w)
-    cv2.line(frame, (nx0, ny), (nx1, ny), (230, 230, 230), 3)
+    cv2.fillPoly(overlay, [top], (110, 60, 15), cv2.LINE_AA)
+    cv2.fillPoly(overlay, [front], (60, 30, 5), cv2.LINE_AA)
+    cv2.addWeighted(overlay, TABLE_ALPHA, frame, 1 - TABLE_ALPHA, 0, frame)
+    cv2.polylines(frame, [top], True, (255, 255, 255), 3, cv2.LINE_AA)
+    centre = _pts((0, 0, TABLE_NEAR), (0, 0, TABLE_FAR), w=w, h=h)
+    cv2.line(frame, tuple(centre[0]), tuple(centre[1]), (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_net(frame):
+    h, w = frame.shape[:2]
+    hw = TABLE_HALF_WIDTH + 0.15
+    net = _pts((-hw, 0, NET_Z), (hw, 0, NET_Z), (hw, NET_HEIGHT, NET_Z),
+               (-hw, NET_HEIGHT, NET_Z), w=w, h=h)
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [net], (200, 200, 200), cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+    cv2.line(frame, tuple(net[3]), tuple(net[2]), (250, 250, 250), 3, cv2.LINE_AA)  # tape
+    for a, b in ((net[0], net[3]), (net[1], net[2])):                                # posts
+        cv2.line(frame, tuple(a), tuple(b), (40, 40, 40), 4, cv2.LINE_AA)
+
+
+def draw_ball(frame, ball, now):
+    h, w = frame.shape[:2]
+    shadow = ball.shadow(now, w, h)
+    if shadow is not None:
+        sx, sy, sr = shadow
+        overlay = frame.copy()
+        cv2.ellipse(overlay, (sx, sy), (sr, max(1, sr // 3)), 0, 0, 360, (20, 20, 20), -1,
+                    cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    bx, by, br = ball.screen(now, w, h)
+    cv2.circle(frame, (bx, by), br, (0, 150, 255), -1, cv2.LINE_AA)
+    cv2.circle(frame, (bx, by), br, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.circle(frame, (bx - br // 3, by - br // 3), max(1, br // 4), (170, 220, 255), -1,
+               cv2.LINE_AA)
 
 
 def text(frame, s, org, scale=0.7, color=(255, 255, 255), thick=2):
@@ -488,31 +655,38 @@ def centred(frame, s, y, scale=1.4, color=(255, 255, 255)):
     text(frame, s, ((frame.shape[1] - tw) // 2, y), scale, color, 3)
 
 
-def draw_hud(frame, game, paddle_xy, swing, now, sim, tags):
+def draw_hud(frame, game, paddle, swing, now, sim, tags):
     h, w = frame.shape[:2]
 
-    for tag_id, corners in tags:
+    for tag_id, corners, hold in tags:
         pts = corners.astype(np.int32)
         # Tags are detected on the raw frame; mirror to match the display.
         pts[:, 0] = w - 1 - pts[:, 0]
-        cv2.polylines(frame, [pts], True, (0, 220, 255), 3)
+        colour = (0, 255, 0) if hold >= 1 else (0, 220, 255)
+        cv2.polylines(frame, [pts], True, colour, 3, cv2.LINE_AA)
         label = "START" if tag_id == START_TAG else f"LEVEL {tag_id}"
-        text(frame, label, tuple(pts.min(axis=0) - [0, 8]), 0.7, (0, 220, 255))
+        x0, y0 = pts.min(axis=0)
+        text(frame, label, (int(x0), int(y0) - 12), 0.7, colour)
+        # Hold bar: fills while the tag is held, fires when full.
+        bw = int(pts[:, 0].max() - x0)
+        cv2.rectangle(frame, (int(x0), int(y0) - 8), (int(x0) + bw, int(y0) - 3), (60, 60, 60), -1)
+        cv2.rectangle(frame, (int(x0), int(y0) - 8), (int(x0) + int(bw * hold), int(y0) - 3),
+                      colour, -1)
 
-    if game.ball is not None and game.state == PLAYING:
-        bx, by, br = game.ball.screen(now, w, h)
-        shadow_y = int(min(0.97, game.ball.target[1] + 0.04) * h) if game.ball.incoming else by
-        cv2.ellipse(frame, (bx, max(by, shadow_y)), (br, max(1, br // 3)), 0, 0, 360,
-                    (40, 40, 40), -1)
-        cv2.circle(frame, (bx, by), br, (0, 165, 255), -1)
-        cv2.circle(frame, (bx, by), br, (255, 255, 255), 1)
+    # The paddle goes under the ball, so you can see the ball meet it.
+    if paddle is not None:
+        draw_paddle(frame, paddle, swing.peak(now, SWING_WINDOW_S) >= game.swing_threshold)
 
-    if paddle_xy is not None:
-        px, py = int(paddle_xy[0] * w), int(paddle_xy[1] * h)
-        swinging = swing.peak(now, SWING_WINDOW_S) >= game.swing_threshold
-        colour = (0, 255, 0) if swinging else (0, 0, 255)
-        cv2.circle(frame, (px, py), int(HIT_RADIUS * w), colour, 2)
-        cv2.circle(frame, (px, py), 6, colour, -1)
+    # The net hides a ball that is still on the far side of it.
+    ball = game.ball if game.state == PLAYING else None
+    if ball is not None and ball.depth(now, w, h) > NET_Z:
+        draw_ball(frame, ball, now)
+        draw_net(frame)
+    else:
+        draw_net(frame)
+        if ball is not None:
+            draw_ball(frame, ball, now)
+
 
     # Score panel.
     text(frame, f"Streak {game.streak}", (14, 34), 0.9, (255, 255, 255))
@@ -549,6 +723,43 @@ def draw_hud(frame, game, paddle_xy, swing, now, sim, tags):
         centred(frame, game.flash[0], int(h * 0.42), 1.6, game.flash[1])
 
 
+# --- camera ----------------------------------------------------------------
+
+def builtin_camera_index():
+    """OpenCV index of the Mac's built-in camera, or None if there isn't one.
+
+    OpenCV's AVFoundation backend numbers cameras in order of their unique id,
+    not the order System Settings lists them -- with an iPhone attached over
+    Continuity Camera the iPhone is 0 and the built-in camera is 1.
+    """
+    try:
+        raw = subprocess.check_output(["system_profiler", "SPCameraDataType", "-json"],
+                                      text=True, stderr=subprocess.DEVNULL)
+        cams = json.loads(raw).get("SPCameraDataType", [])
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return None
+    cams.sort(key=lambda c: c.get("spcamera_unique-id", ""))
+    for i, c in enumerate(cams):
+        name = f"{c.get('_name', '')} {c.get('spcamera_model-id', '')}"
+        if "FaceTime" in name or "Built-in" in name:
+            return i
+    return None
+
+
+def open_camera(index, width=1280, height=720):
+    """Open a camera by index; returns (cap, start_ms) like camlib.pick_camera."""
+    cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera {index}. "
+                           "Check System Settings -> Privacy & Security -> Camera.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    time.sleep(0.5)                  # let the sensor settle
+    return cap, int(time.time() * 1000)
+
+
 # --- main ------------------------------------------------------------------
 
 def main():
@@ -564,6 +775,10 @@ def main():
     ap.add_argument("--swing-threshold", type=float, default=None,
                     help=f"|gyro| that counts as a swing (default {SWING_THRESHOLD})")
     ap.add_argument("--no-buzz", action="store_true", help="don't buzz the motors on a hit")
+    ap.add_argument("--camera", type=int, default=None,
+                    help="OpenCV camera index (default: the Mac's built-in camera)")
+    ap.add_argument("--pick-camera", action="store_true",
+                    help="choose the camera from live previews instead")
     args = ap.parse_args()
 
     card_color = None
@@ -589,7 +804,18 @@ def main():
     tags = TagReader()
     swing = SwingMeter()
 
-    cap, start_ms = pick_camera()
+    camera = args.camera
+    if camera is None and not args.pick_camera:
+        camera = builtin_camera_index()
+        if camera is None:
+            print("[camera] no built-in camera found; pick one")
+    if camera is None:
+        cap, start_ms = pick_camera()
+    else:
+        print(f"[camera] using camera {camera}")
+        cap, start_ms = open_camera(camera)
+    print(f"[camera] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     hand = args.hand
     last_paddle = None
     torso = (0.5, 0.45, 0.2)        # sensible default until we first see shoulders
@@ -616,20 +842,22 @@ def main():
                 elif held in LEVELS:
                     game.set_level(held, now)
 
-            frame = cv2.flip(raw, 1)
-            h, w = frame.shape[:2]
+            # Pose runs on the raw frame too, then gets mirrored (see mirror()).
             ts_ms = int(time.time() * 1000) - start_ms
             result = landmarker.detect_for_video(
                 Image(image_format=ImageFormat.SRGB,
-                      data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), ts_ms)
+                      data=cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)), ts_ms)
+            frame = cv2.flip(raw, 1)
+            h, w = frame.shape[:2]
 
-            paddle_xy = None
+            held = None             # where the paddle is drawn this frame
             if result.pose_landmarks:
-                landmarks = result.pose_landmarks[0]
+                landmarks = mirror(result.pose_landmarks[0])
                 draw_skeleton(frame, landmarks)
-                paddle_xy, seen_torso = read_pose(landmarks, hand)
+                held, seen_torso = read_pose(landmarks, hand, w, h)
                 if seen_torso is not None:
                     torso = seen_torso
+            paddle_xy = held["center"] if held is not None else None
 
             # Swing signal: the hub's gyro, or in --sim the paddle's screen speed.
             if args.sim:
@@ -646,7 +874,7 @@ def main():
             game.update(now, paddle_xy, swing, torso, w, h)
 
             draw_table(frame)
-            draw_hud(frame, game, paddle_xy, swing, now, args.sim, seen)
+            draw_hud(frame, game, held, swing, now, args.sim, seen)
             cv2.imshow("Ping Pong", frame)
 
             key = cv2.waitKey(1) & 0xFF
